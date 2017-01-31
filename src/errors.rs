@@ -13,7 +13,14 @@
 // limitations under the License.
 
 error_chain! {
+    errors {
+        ServerStartupTimedOut
+        BadCommandline(s: &'static str) {
+            display("sccache: {}", s)
+        }
+    }
     foreign_links {
         Io(::std::io::Error);
+        Protobuf(::protobuf::ProtobufError);
     }
 }

@@ -122,7 +122,7 @@ pub fn parse() -> Result<Command> {
         is_some(&cmd),
             ].iter()
         .fold(0, |acc, &x| acc + (x as usize)) > 1 {
-            bail!("Too many commands specified");
+            bail!(ErrorKind::BadCommandline("Too many commands specified"));
         }
     if internal_start_server {
         Ok(Command::InternalStartServer)
@@ -143,9 +143,9 @@ pub fn parse() -> Result<Command> {
                 cwd: cwd,
             })
         } else {
-            bail!("No compile command");
+            bail!(ErrorKind::BadCommandline("No compile command"));
         }
     } else {
-        bail!("No command specified");
+        bail!(ErrorKind::BadCommandline("No command specified"));
     }
 }

@@ -21,6 +21,7 @@ use cmdline::Command;
 use compiler::{
     run_input_output,
 };
+use errors::*;
 use log::LogLevel::Trace;
 use mock_command::{
     CommandCreatorSync,
@@ -50,8 +51,6 @@ use std::ffi::{OsStr,OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{
     self,
-    Error,
-    ErrorKind,
     Read,
     Write,
 };
@@ -77,17 +76,6 @@ enum CompileResponse {
     UnhandledCompile(UnhandledCompile),
 }
 
-// Should this just be a Result?
-/// Result of background server startup.
-enum ServerStartup {
-    /// Server started successfully.
-    Ok,
-    /// Timed out waiting for server startup.
-    TimedOut,
-    /// Server encountered an error.
-    Err(String),
-}
-
 /// Get the port on which the server should listen.
 fn get_port() -> u16 {
     env::var("SCCACHE_SERVER_PORT")
@@ -99,76 +87,79 @@ fn get_port() -> u16 {
 /// Re-execute the current executable as a background server, and wait
 /// for it to start up.
 #[cfg(not(windows))]
-fn run_server_process() -> io::Result<ServerStartup> {
+fn run_server_process() -> Result<()> {
     use libc::{c_int, poll, pollfd, nfds_t, POLLIN, POLLERR};
     use tempdir::TempDir;
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixListener;
 
     trace!("run_server_process");
-    let tempdir = try!(TempDir::new("sccache"));
+    let tempdir = try!(TempDir::new("sccache")
+                       .chain_err(|| "Failed to create temporary directory"));
     let socket_path = tempdir.path().join("sock");
     let listener = try!(UnixListener::bind(&socket_path));
-    env::current_exe()
-        .and_then(|exe_path| {
-            process::Command::new(exe_path)
-                .env("SCCACHE_START_SERVER", "1")
-                .env("SCCACHE_STARTUP_NOTIFY", &socket_path)
-                .env("RUST_BACKTRACE", "1")
-                .spawn()
-        })
-        .and_then(|_| {
-            // wait for a connection on the listener using `poll`
-            let mut pfds = vec![pollfd {
-                fd: listener.as_raw_fd(),
-                events: POLLIN | POLLERR,
-                revents: 0,
-            }];
-            loop {
-                match unsafe { poll(pfds.as_mut_ptr(), pfds.len() as nfds_t, SERVER_STARTUP_TIMEOUT_MS as c_int) } {
-                    // Timed out.
-                    0 => return Ok(ServerStartup::TimedOut),
-                    // Error.
-                    -1 => {
-                        let e = Error::last_os_error();
-                        match e.kind() {
-                            // We should retry on EINTR.
-                            ErrorKind::Interrupted => {}
-                            _ => return Err(e),
-                        }
-                    }
-                    // Success.
-                    _ => {
-                        if pfds[0].revents & POLLIN == POLLIN {
-                            // Ready to read
-                            break;
-                        }
-                        if pfds[0].revents & POLLERR == POLLERR {
-                            // Could give a better error here, I suppose?
-                            return Ok(ServerStartup::TimedOut);
-                        }
-                    }
+    try!(env::current_exe()
+         .and_then(|exe_path| {
+             process::Command::new(exe_path)
+                 .env("SCCACHE_START_SERVER", "1")
+                 .env("SCCACHE_STARTUP_NOTIFY", &socket_path)
+                 .env("RUST_BACKTRACE", "1")
+                 .spawn()
+         })
+         .chain_err(|| "Failed to spawn server daemon process"));
+    // wait for a connection on the listener using `poll`
+    let mut pfds = vec![pollfd {
+        fd: listener.as_raw_fd(),
+        events: POLLIN | POLLERR,
+        revents: 0,
+    }];
+    loop {
+        match unsafe { poll(pfds.as_mut_ptr(), pfds.len() as nfds_t, SERVER_STARTUP_TIMEOUT_MS as c_int) } {
+            // Timed out.
+            0 => bail!(ErrorKind::ServerStartupTimedOut),
+            // Error.
+            -1 => {
+                let e = io::Error::last_os_error();
+                match e.kind() {
+                    // We should retry on EINTR.
+                    io::ErrorKind::Interrupted => {}
+                    //TODO: could chain the error
+                    _ => bail!("Failed to start server"),
                 }
             }
-            // Now read a status from the socket.
-            //TODO: when we're using serde, use that here.
-            let (mut stream, _) = try!(listener.accept());
-            let mut buffer = [0; 1];
-            try!(stream.read_exact(&mut buffer));
-            if buffer[0] == 0 {
-                info!("Server started up successfully");
-                Ok(ServerStartup::Ok)
-            } else {
-                //TODO: send error messages over the socket as well.
-                error!("Server startup failed: {}", buffer[0]);
-                Ok(ServerStartup::Err(format!("Server startup failed: {}", buffer[0])))
+            // Success.
+            _ => {
+                if pfds[0].revents & POLLIN == POLLIN {
+                    // Ready to read
+                    break;
+                }
+                if pfds[0].revents & POLLERR == POLLERR {
+                    // Could give a better error here, I suppose?
+                    bail!("Failed to start server");
+                }
             }
-        })
+        }
+    }
+    // Now read a status from the socket.
+    //TODO: when we're using serde, use that here.
+    let (mut stream, _) = try!(listener.accept()
+                               .chain_err(|| "Failed to start server"));
+    let mut buffer = [0; 1];
+    try!(stream.read_exact(&mut buffer).chain_err(|| "Failed to start server"));
+    if buffer[0] == 0 {
+        info!("Server started up successfully");
+        Ok(())
+    } else {
+        //TODO: send error messages over the socket as well.
+        let msg = format!("Failed to start server: {}", buffer[0]);
+        error!("{}", msg);
+        bail!(msg);
+    }
 }
 
 /// Pipe `cmd`'s stdio to `/dev/null`, unless a specific env var is set.
 #[cfg(not(windows))]
-fn daemonize() -> io::Result<()> {
+fn daemonize() -> Result<()> {
     use daemonize::Daemonize;
     if match env::var("SCCACHE_NO_DAEMON") {
             Ok(val) => val == "1",
@@ -177,16 +168,16 @@ fn daemonize() -> io::Result<()> {
         Ok(())
     } else {
         Daemonize::new().start()
-            .or(Err(Error::new(ErrorKind::Other, "Failed to daemonize")))
+            .chain_err(|| "Failed to daemonize")
     }
 }
 
 /// This is a no-op on Windows.
 #[cfg(windows)]
-fn daemonize() -> io::Result<()> { Ok(()) }
+fn daemonize() -> Result<()> { Ok(()) }
 
 #[cfg(not(windows))]
-fn redirect_stderr(f: File) -> io::Result<()> {
+fn redirect_stderr(f: File) -> Result<()> {
     use libc::dup2;
     use std::os::unix::io::IntoRawFd;
     // Ignore errors here.
@@ -195,7 +186,7 @@ fn redirect_stderr(f: File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn redirect_stderr(f: File) -> io::Result<()> {
+fn redirect_stderr(f: File) -> Result<()> {
     use kernel32::SetStdHandle;
     use winapi::winbase::STD_ERROR_HANDLE;
     use std::os::windows::io::IntoRawHandle;
@@ -205,9 +196,14 @@ fn redirect_stderr(f: File) -> io::Result<()> {
 }
 
 /// If `SCCACHE_ERROR_LOG` is set, redirect stderr to it.
-fn redirect_error_log() -> io::Result<()> {
+fn redirect_error_log() -> Result<()> {
     match env::var("SCCACHE_ERROR_LOG") {
-        Ok(filename) => OpenOptions::new().create(true).append(true).open(filename).and_then(redirect_stderr),
+        Ok(filename) => OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(filename)
+            .chain_err(|| "Failed to open error log")
+            .and_then(redirect_stderr),
         _ => Ok(()),
     }
 }
@@ -219,7 +215,7 @@ fn redirect_error_log() -> io::Result<()> {
 /// TODO: remove this all when `CommandExt::creation_flags` hits stable:
 /// https://github.com/rust-lang/rust/issues/37827
 #[cfg(windows)]
-fn run_server_process() -> io::Result<ServerStartup> {
+fn run_server_process() -> Result<()> {
     use kernel32;
     use named_pipe::PipeOptions;
     use std::io::Error;
@@ -234,7 +230,8 @@ fn run_server_process() -> io::Result<ServerStartup> {
     trace!("run_server_process");
     // Create a pipe to get startup status back from the server.
     let pipe_name = format!(r"\\.\pipe\{}", Uuid::new_v4().simple());
-    let server = try!(PipeOptions::new(&pipe_name).single());
+    let server = try!(PipeOptions::new(&pipe_name).single()
+                      .chain_err(|| "Failed to start server"));
     env::current_exe()
         .and_then(|exe_path| {
             let mut exe = OsStr::new(&exe_path)
@@ -279,103 +276,100 @@ fn run_server_process() -> io::Result<ServerStartup> {
                 }
                 Ok(())
             } else {
-                Err(Error::last_os_error())
+                //TODO: chain Error::last_os_error()
+                bail!("Failed to start server")
             }
         })
         .and_then(|()| {
             // Wait for a connection on the pipe.
-            let mut pipe = match try!(server.wait_ms(SERVER_STARTUP_TIMEOUT_MS)) {
+            let mut pipe = match try!(server.wait_ms(SERVER_STARTUP_TIMEOUT_MS)
+                                      .chain_err(|| "Failed to start server")) {
                 Ok(pipe) => pipe,
-                Err(_) => return Ok(ServerStartup::TimedOut),
+                Err(_) => bail!(ErrorKind::ServerStartupTimedOut),
             };
             // It would be nice to have a read timeout here.
             let mut buffer = [0; 1];
-            try!(pipe.read_exact(&mut buffer));
+            try!(pipe.read_exact(&mut buffer)
+                 .chain_err(|| "Failed to start server"));
             if buffer[0] == 0 {
                 info!("Server started up successfully");
-                Ok(ServerStartup::Ok)
+                Ok(())
             } else {
                 //TODO: send error messages over the socket as well.
-                error!("Server startup failed: {}", buffer[0]);
-                Ok(ServerStartup::Err(format!("Server startup failed: {}", buffer[0])))
+                let msg = format!("Failed to start server: {}", buffer[0]);
+                error!("{}", msg);
+                bail!(msg);
             }
         })
-}
-
-/// Convert `res` into a process exit code.
-///
-/// If `res` is `Ok`, return `0`, else call `else_func` and then
-/// return 1.
-fn result_exit_code<T : FnOnce(io::Error)>(res : io::Result<()>,
-                                           else_func : T) -> i32 {
-    res.and(Ok(0)).unwrap_or_else(|e| {
-        else_func(e);
-        1
-    })
 }
 
 /// Attempt to connect to an sccache server listening on `port`, or start one if no server is running.
-fn connect_or_start_server(port: u16) -> io::Result<ServerConnection> {
+fn connect_or_start_server(port: u16) -> Result<ServerConnection> {
     trace!("connect_or_start_server({})", port);
-    connect_to_server(port).or_else(|e|
-        match e.kind() {
-            io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut => {
-                // If the connection was refused we probably need to start
-                // the server.
-                //TODO: check startup value!
-                run_server_process().and_then(|_startup| connect_with_retry(port))
+    connect_to_server(port).or_else(|e| {
+        if match &e {
+            &Error(ErrorKind::Io(ref ioe), _) => {
+                match ioe.kind() {
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut => true,
+                    _ => false,
+                }
             }
-            _ => {
-                debug!("Error: {}", e);
-                Err(e)
-            }
-        })
+            _ => false
+        } {
+            // If the connection was refused we probably need to start
+            // the server.
+            run_server_process().and_then(|_| connect_with_retry(port))
+        } else {
+            debug!("Failed to connect to server: {}", e);
+            Err(e.into())
+        }
+    })
 }
 
 /// Send a `ZeroStats` request to the server, and return the `CacheStats` request if successful.
-pub fn request_zero_stats(mut conn : ServerConnection) -> io::Result<CacheStats> {
+pub fn request_zero_stats(mut conn : ServerConnection) -> Result<CacheStats> {
     debug!("request_stats");
     let mut req = ClientRequest::new();
     req.set_zero_stats(ZeroStats::new());
     //TODO: better error mapping
-    let mut response = try!(conn.request(req).or(Err(Error::new(ErrorKind::Other, "Failed to send zero statistics command to server or failed to receive respone"))));
+    let mut response = try!(conn.request(req).chain_err(|| "Failed to send zero statistics command to server or failed to receive respone"));
     if response.has_stats() {
         Ok(response.take_stats())
     } else {
-        Err(Error::new(ErrorKind::Other, "Unexpected server response!"))
+        bail!("Unexpected server response!")
     }
 }
 
 /// Send a `GetStats` request to the server, and return the `CacheStats` request if successful.
-pub fn request_stats(mut conn : ServerConnection) -> io::Result<CacheStats> {
+pub fn request_stats(mut conn : ServerConnection) -> Result<CacheStats> {
     debug!("request_stats");
     let mut req = ClientRequest::new();
     req.set_get_stats(GetStats::new());
     //TODO: better error mapping
-    let mut response = try!(conn.request(req).or(Err(Error::new(ErrorKind::Other, "Failed to send data to or receive data from server"))));
+    let mut response = try!(conn.request(req).chain_err(|| "Failed to send data to or receive data from server"));
     if response.has_stats() {
         Ok(response.take_stats())
     } else {
-        Err(Error::new(ErrorKind::Other, "Unexpected server response!"))
+        bail!("Unexpected server response!")
     }
 }
 
 /// Send a `Shutdown` request to the server, and return the `CacheStats` contained within the response if successful.
-pub fn request_shutdown(mut conn : ServerConnection) -> io::Result<CacheStats> {
+pub fn request_shutdown(mut conn : ServerConnection) -> Result<CacheStats> {
     debug!("request_shutdown");
     let mut req = ClientRequest::new();
     req.set_shutdown(Shutdown::new());
     //TODO: better error mapping
-    let mut response = try!(conn.request(req).or(Err(Error::new(ErrorKind::Other, "Failed to send data to or receive data from server"))));
+    let mut response = try!(conn.request(req).chain_err(|| "Failed to send data to or receive data from server"));
     if response.has_shutting_down() {
         Ok(response.take_shutting_down().take_stats())
     } else {
-        Err(Error::new(ErrorKind::Other, "Unexpected server response!"))
+        bail!("Unexpected server response!")
     }
 }
 
 /// Print `stats` to stdout.
-fn print_stats(stats: CacheStats) -> io::Result<()> {
+fn print_stats(stats: CacheStats) -> Result<()> {
     let formatted = stats.get_stats().iter()
         .map(|s| (s.get_name(), if s.has_count() {
             format!("{}", s.get_count())
@@ -399,13 +393,13 @@ fn print_stats(stats: CacheStats) -> io::Result<()> {
 }
 
 /// Send a `Compile` request to the server, and return the server response if successful.
-fn request_compile<W: AsRef<Path>, X: AsRef<OsStr>, Y: AsRef<Path>>(conn: &mut ServerConnection, exe: W, args: &Vec<X>, cwd: Y) -> io::Result<CompileResponse> {
+fn request_compile<W: AsRef<Path>, X: AsRef<OsStr>, Y: AsRef<Path>>(conn: &mut ServerConnection, exe: W, args: &Vec<X>, cwd: Y) -> Result<CompileResponse> {
     //TODO: It'd be nicer to send these over as raw bytes.
-    let exe = try!(exe.as_ref().to_str().ok_or(Error::new(ErrorKind::Other, "Bad exe")));
-    let cwd = try!(cwd.as_ref().to_str().ok_or(Error::new(ErrorKind::Other, "Bad cwd")));
+    let exe = try!(exe.as_ref().to_str().ok_or_else(|| "Bad exe filename"));
+    let cwd = try!(cwd.as_ref().to_str().ok_or_else(|| "Bad cwd"));
     let args = args.iter().filter_map(|a| a.as_ref().to_str().map(|s| s.to_owned())).collect::<Vec<_>>();
     if args.is_empty() {
-        return Err(Error::new(ErrorKind::Other, "Bad commandline"));
+        bail!("Empty commandline");
     }
     let mut req = ClientRequest::new();
     let mut compile = Compile::new();
@@ -415,32 +409,32 @@ fn request_compile<W: AsRef<Path>, X: AsRef<OsStr>, Y: AsRef<Path>>(conn: &mut S
     trace!("request_compile: {:?}", compile);
     req.set_compile(compile);
     //TODO: better error mapping?
-    let mut response = try!(conn.request(req).or(Err(Error::new(ErrorKind::Other, "Failed to send data to or receive data from server"))));
+    let mut response = try!(conn.request(req).chain_err(|| "Failed to send data to or receive data from server"));
     if response.has_compile_started() {
         Ok(CompileResponse::CompileStarted(response.take_compile_started()))
     } else if response.has_unhandled_compile() {
         Ok(CompileResponse::UnhandledCompile(response.take_unhandled_compile()))
     } else {
-        Err(Error::new(ErrorKind::Other, "Unexpected response from server"))
+        bail!("Unexpected response from server")
     }
 }
 
 /// Return the signal that caused a process to exit from `status`.
 #[cfg(unix)]
 #[allow(dead_code)]
-fn status_signal(status : process::ExitStatus) -> Option<i32> {
+fn status_signal(status: process::ExitStatus) -> Option<i32> {
     status.signal()
 }
 
 /// Not implemented for non-Unix.
 #[cfg(not(unix))]
 #[allow(dead_code)]
-fn status_signal(_status : process::ExitStatus) -> Option<i32> {
+fn status_signal(_status: process::ExitStatus) -> Option<i32> {
     None
 }
 
 /// Handle `response`, the output from running a compile on the server. Return the compiler exit status.
-fn handle_compile_finished<T : Write, U : Write>(response : CompileFinished, stdout : &mut T, stderr : &mut U) -> io::Result<i32> {
+fn handle_compile_finished<T: Write, U: Write>(response: CompileFinished, stdout: &mut T, stderr: &mut U) -> Result<i32> {
     trace!("handle_compile_finished");
     // It might be nice if the server sent stdout/stderr as the process
     // ran, but then it would have to also save them in the cache as
@@ -478,25 +472,27 @@ fn handle_compile_response<T, U, V, W, X, Y>(mut creator: T,
                                              cmdline: Vec<X>,
                                              cwd: Y,
                                              stdout: &mut U,
-                                             stderr: &mut V) -> io::Result<i32>
-  where T : CommandCreatorSync, U : Write, V : Write, W: AsRef<OsStr>, X: AsRef<OsStr>, Y: AsRef<Path> {
+                                             stderr: &mut V) -> Result<i32>
+    where T: CommandCreatorSync,
+          U: Write,
+          V: Write,
+          W: AsRef<OsStr>,
+          X: AsRef<OsStr>,
+          Y: AsRef<Path>
+{
     match response {
         CompileResponse::CompileStarted(_) => {
             debug!("Server sent CompileStarted");
             // Wait for CompileFinished.
             conn.read_one_response()
-                .or_else(|err| {
-                    //TODO: something better here?
-                    error!("Error reading compile response from server: {}", err);
-                    Err(Error::new(ErrorKind::Other, "Error reading compile response from server"))
-                })
+                .chain_err(|| "Error reading compile response from server")
                 .and_then(|mut res| {
                     if res.has_compile_finished() {
                         trace!("Server sent CompileFinished");
                         handle_compile_finished(res.take_compile_finished(),
                                                 stdout, stderr)
                     } else {
-                        Err(Error::new(ErrorKind::Other, "Unexpected response from server"))
+                        bail!("Unexpected response from server")
                     }
                 })
         }
@@ -510,6 +506,7 @@ fn handle_compile_response<T, U, V, W, X, Y>(mut creator: T,
                 trace!("running command: {:?}", cmd);
             }
             run_input_output(cmd, None)
+                .chain_err(|| "Failed to run compiler")
                 .and_then(|output| {
                     if !output.stdout.is_empty() {
                         try!(stdout.write_all(&output.stdout));
@@ -527,7 +524,7 @@ fn handle_compile_response<T, U, V, W, X, Y>(mut creator: T,
                        });
                             */
                            // Arbitrary.
-                           2
+                          2 
                        }))
                 })
         }
@@ -546,76 +543,64 @@ pub fn do_compile<T, U, V, W, X, Y>(creator: T,
                                     cwd: Y,
                                     path: Option<OsString>,
                                     stdout: &mut U,
-                                    stderr: &mut V) -> io::Result<i32>
-  where T : CommandCreatorSync, U : Write, V : Write, W: AsRef<OsStr>, X: AsRef<OsStr>, Y: AsRef<Path> {
+                                    stderr: &mut V) -> Result<i32>
+    where T: CommandCreatorSync,
+U : Write, V : Write, W: AsRef<OsStr>, X: AsRef<OsStr>, Y: AsRef<Path>
+{
       trace!("do_compile");
     which_in(exe, path, &cwd)
-          .map_err( |x: &'static str| Error::new(ErrorKind::Other, x))
-          .and_then(|exe_path| {
-              request_compile(&mut conn, &exe_path, &cmdline, &cwd)
-                  .and_then(|res| handle_compile_response(creator, &mut conn, res, exe_path, cmdline, cwd, stdout, stderr))
-          })
+        .map_err(|_| Error::from_kind(ErrorKind::Msg("Failed to locate compiler binary".to_owned())))
+        .and_then(|exe_path| {
+            request_compile(&mut conn, &exe_path, &cmdline, &cwd)
+                .and_then(|res| handle_compile_response(creator, &mut conn, res, exe_path, cmdline, cwd, stdout, stderr))
+        })
 }
 
 /// Run `cmd` and return the process exit status.
-pub fn run_command(cmd : Command) -> i32 {
+pub fn run_command(cmd: Command) -> Result<i32> {
     match cmd {
         Command::ShowStats => {
             trace!("Command::ShowStats");
-            result_exit_code(connect_or_start_server(get_port()).and_then(request_stats).and_then(print_stats),
-                             |e| {
-                                 println!("Couldn't get stats from server: {}", e);
-                             })
+            connect_or_start_server(get_port()).and_then(request_stats).and_then(print_stats).and(Ok(0)).chain_err(|| "Couldn't get stats from server")
         },
         Command::InternalStartServer => {
             trace!("Command::InternalStartServer");
-            // Can't report failure here, we're already daemonized.
-            result_exit_code(daemonize()
-                             .and_then(|_| redirect_error_log())
-                             .and_then(|_| server::start_server(get_port())),
-                             |_| {})
+            // Can't report failure here, we're already daemonized, but
+            // start server will report failures back to the client over
+            // a pipe or unix socket.
+            daemonize()
+                .and_then(|_| redirect_error_log())
+                .and_then(|_| server::start_server(get_port()))
+                .and(Ok(0))
         },
         Command::StartServer => {
             trace!("Command::StartServer");
             println!("Starting sccache server...");
-            result_exit_code(run_server_process()
-                             .and_then(|startup| {
-                                 match startup {
-                                     ServerStartup::Ok => Ok(()),
-                                     ServerStartup::TimedOut => Err(Error::new(ErrorKind::Other, "Timed out waiting for server startup")),
-                                     ServerStartup::Err(_e) => Err(Error::new(ErrorKind::Other, "Server startup error")),
-                                 }
-                             }),
-                             |e| {
-                                 println!("Failed to start server: {}", e);
-                             })
+            run_server_process()
+                .and(Ok(0))
         },
         Command::StopServer => {
             trace!("Command::StopServer");
             println!("Stopping sccache server...");
-            result_exit_code(connect_to_server(get_port()).and_then(request_shutdown).and_then(print_stats),
-                             |_e| {
-                                 //TODO: check if this was connection refused,
-                                 // print error if not.
-                                 println!("Couldn't connect to server");
-                             })
-
+            connect_to_server(get_port())
+                .and_then(request_shutdown)
+                .and_then(print_stats)
+                .and(Ok(0))
+                .chain_err(|| "Couldn't connect to server")
         },
         Command::Compile { exe, cmdline, cwd } => {
             trace!("Command::Compile {{ {:?}, {:?}, {:?} }}", exe, cmdline, cwd);
             connect_or_start_server(get_port())
                 .and_then(|conn| do_compile(ProcessCommandCreator, conn, &exe, cmdline, &cwd, env::var_os("PATH"), &mut io::stdout(), &mut io::stderr()))
-                .unwrap_or_else(|e| {
-                    println!("Failed to execute compile: {}", e);
-                    1
-                })
+                .chain_err(|| "Failed to execute compile")
         },
         Command::ZeroStats => {
             trace!("Command::ZeroStats");
-            result_exit_code(connect_or_start_server(get_port()).and_then(request_zero_stats).and_then(print_stats),
-                             |e| {
-                                 println!("Couldn't zero stats on server: {}", e);
-                             })
+            connect_or_start_server(get_port())
+                .and_then(request_zero_stats)
+                .and_then(print_stats)
+                .and(Ok(0))
+                .chain_err(|| "Couldn't zero stats on server")
         },
     }
 }

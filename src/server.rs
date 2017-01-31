@@ -27,6 +27,7 @@ use compiler::{
     ParsedArguments,
     get_compiler_info,
 };
+use errors::Result;
 use filetime::FileTime;
 use futures::Future;
 use mio::*;
@@ -1064,7 +1065,7 @@ fn notify_server_startup(name: &OsStr, success: bool) -> io::Result<()> {
 ///
 /// Spins an event loop handling client connections until a client
 /// requests a shutdown.
-pub fn start_server(port : u16) -> io::Result<()> {
+pub fn start_server(port: u16) -> Result<()> {
     debug!("start_server");
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
     let (server, event_loop) = try!(create_server::<ProcessCommandCreator>(port, storage_from_environment()).or_else(|e| {
@@ -1077,5 +1078,5 @@ pub fn start_server(port : u16) -> io::Result<()> {
     if let Some(ref name) = notify {
         try!(notify_server_startup(name, true));
     }
-    run_server(server, event_loop)
+    Ok(try!(run_server(server, event_loop)))
 }

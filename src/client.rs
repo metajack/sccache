@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use errors::*;
 use protobuf::{
     CodedInputStream,
     Message,
-    ProtobufError,
-    ProtobufResult,
     parse_from_bytes,
 };
 use protocol::{
@@ -25,7 +24,6 @@ use protocol::{
 };
 use retry::retry;
 use std::io::{
-    self,
     BufReader,
     BufWriter,
     Read,
@@ -36,33 +34,33 @@ use std::net::TcpStream;
 /// A connection to an sccache server.
 pub struct ServerConnection {
     /// A reader for the socket connected to the server.
-    reader : BufReader<TcpStream>,
+    reader: BufReader<TcpStream>,
     /// A writer for the socket connected to the server.
-    writer : BufWriter<TcpStream>,
+    writer: BufWriter<TcpStream>,
 }
 
 impl ServerConnection {
     /// Create a new connection using `stream`.
-    pub fn new(stream : TcpStream) -> io::Result<ServerConnection> {
+    pub fn new(stream: TcpStream) -> Result<ServerConnection> {
         let writer = try!(stream.try_clone());
         Ok(ServerConnection {
-            reader : BufReader::new(stream),
-            writer : BufWriter::new(writer),
+            reader: BufReader::new(stream),
+            writer: BufWriter::new(writer),
         })
     }
 
     /// Send `request` to the server, read and return a `ServerResponse`.
-    pub fn request(&mut self, request : ClientRequest)
-                   -> ProtobufResult<ServerResponse> {
+    pub fn request(&mut self, request: ClientRequest)
+                   -> Result<ServerResponse> {
         trace!("ServerConnection::request");
         try!(request.write_length_delimited_to_writer(&mut self.writer));
-        try!(self.writer.flush().or_else(|e| Err(ProtobufError::IoError(e))));
+        try!(self.writer.flush());
         trace!("ServerConnection::request: sent request");
         self.read_one_response()
     }
 
     /// Read a single `ServerResponse` from the server.
-    pub fn read_one_response(&mut self) -> ProtobufResult<ServerResponse> {
+    pub fn read_one_response(&mut self) -> Result<ServerResponse> {
         trace!("ServerConnection::read_one_response");
         //FIXME: wish `parse_length_delimited_from` worked here!
         let len = try!({
@@ -71,14 +69,14 @@ impl ServerConnection {
         });
         trace!("Should read {} more bytes", len);
         let mut buf = vec![0; len as usize];
-        try!(self.reader.read_exact(&mut buf).or_else(|e| Err(ProtobufError::IoError(e))));
+        try!(self.reader.read_exact(&mut buf));
         trace!("Done reading");
-        parse_from_bytes::<ServerResponse>(&buf)
+        parse_from_bytes::<ServerResponse>(&buf).chain_err(|| "Failed to parse server response")
     }
 }
 
 /// Establish a TCP connection to an sccache server listening on `port`.
-pub fn connect_to_server(port: u16) -> io::Result<ServerConnection> {
+pub fn connect_to_server(port: u16) -> Result<ServerConnection> {
     trace!("connect_to_server({})", port);
     let stream = try!(TcpStream::connect(("127.0.0.1", port)));
     ServerConnection::new(stream)
@@ -87,7 +85,7 @@ pub fn connect_to_server(port: u16) -> io::Result<ServerConnection> {
 /// Attempt to establish a TCP connection to an sccache server listening on `port`.
 ///
 /// If the connection fails, retry a few times.
-pub fn connect_with_retry(port: u16) -> io::Result<ServerConnection> {
+pub fn connect_with_retry(port: u16) -> Result<ServerConnection> {
     trace!("connect_with_retry({})", port);
     // TODOs:
     // * Pass the server Child in here, so we can stop retrying
@@ -96,7 +94,6 @@ pub fn connect_with_retry(port: u16) -> io::Result<ServerConnection> {
     //   us once it starts the server instead of us polling.
     match retry(10, 500, || connect_to_server(port), |res| res.is_ok()) {
         Ok(Ok(conn)) => Ok(conn),
-        _ => Err(io::Error::new(io::ErrorKind::TimedOut,
-                                "Connection to server timed out")),
+        _ => bail!("Connection to server timed out"),
     }
 }

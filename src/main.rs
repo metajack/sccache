@@ -68,16 +68,21 @@ mod protocol;
 mod server;
 mod simples3;
 
+use errors::*;
 use std::env;
 
 fn main() {
     init_logging();
-    std::process::exit(match cmdline::parse() {
-        Ok(cmd) => commands::run_command(cmd),
-        Err(e) => {
-            println!("sccache: {}", e);
+    std::process::exit(match cmdline::parse().and_then(commands::run_command) {
+        Ok(status) => status,
+        Err(Error(ErrorKind::BadCommandline(msg), _)) => {
+            println!("sccache: {}", msg);
             cmdline::get_app().print_help().unwrap();
             println!("");
+            1
+        }
+        Err(e) => {
+            println!("{}", e);
             1
         }
     });
