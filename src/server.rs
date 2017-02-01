@@ -1040,25 +1040,37 @@ pub fn run_server<C : CommandCreatorSync + 'static>(mut server : SccacheServer<C
     Ok(())
 }
 
-fn notify_server_startup_internal<W: Write>(mut w: W, success: bool) -> io::Result<()> {
-    let data = [ if success { 0 } else { 1 }; 1];
+fn max_str(s: &str, len: usize) -> Vec<u8> {
+    s.as_bytes()[..s.char_indices().map(|(i, c)| i + c.len_utf8()).take_while(|&i| i < len).last().unwrap()].iter().map(|&b| b).collect()
+}
+
+fn notify_server_startup_internal<W: Write>(mut w: W, result: Option<String>) -> io::Result<()> {
+    let data = match result {
+        None => vec![0],
+        Some(msg) => {
+            debug!("notify_server_startup_internal: {}", msg);
+            let mut bytes = max_str(&msg, 255);
+            let len = bytes.len();
+            bytes.insert(0, len as u8);
+            bytes
+        }
+    };
     try!(w.write_all(&data));
     Ok(())
 }
 
 #[cfg(unix)]
-fn notify_server_startup(name: &OsStr, success: bool) -> io::Result<()> {
+fn notify_server_startup(name: &OsStr, result: Option<String>) -> io::Result<()> {
     use std::os::unix::net::UnixStream;
-    debug!("notify_server_startup(success: {})", success);
     let stream = try!(UnixStream::connect(name));
-    notify_server_startup_internal(stream, success)
+    notify_server_startup_internal(stream, result)
 }
 
 #[cfg(windows)]
-fn notify_server_startup(name: &OsStr, success: bool) -> io::Result<()> {
+fn notify_server_startup(name: &OsStr, result: Option<String>) -> io::Result<()> {
     use named_pipe::PipeClient;
     let pipe = try!(PipeClient::connect(name));
-    notify_server_startup_internal(pipe, success)
+    notify_server_startup_internal(pipe, result)
 }
 
 /// Start an sccache server, listening on `port`.
@@ -1071,12 +1083,12 @@ pub fn start_server(port: u16) -> Result<()> {
     let (server, event_loop) = try!(create_server::<ProcessCommandCreator>(port, storage_from_environment()).or_else(|e| {
         error!("failed to create server: {}", e);
         if let Some(ref name) = notify {
-            try!(notify_server_startup(name, false));
+            try!(notify_server_startup(name, Some(e.description().to_owned())));
         }
         Err(e)
     }));
     if let Some(ref name) = notify {
-        try!(notify_server_startup(name, true));
+        try!(notify_server_startup(name, None));
     }
     Ok(try!(run_server(server, event_loop)))
 }

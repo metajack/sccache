@@ -228,7 +228,7 @@ fn test_server_port_in_use() {
         .unwrap();
     assert!(!output.status.success());
     let s = String::from_utf8_lossy(&output.stdout);
-    match s.find("Failed to start server:") {
+    match s.find("Failed to start server: address in use") {
         Some(_) => {},
         None => assert!(false, format!("Output did not contain 'Failed to start server:':\n========\n{}\n========", s)),
     }

@@ -84,6 +84,24 @@ fn get_port() -> u16 {
         .unwrap_or(DEFAULT_PORT)
 }
 
+fn read_server_startup<R: Read>(mut r: R) -> Result<()> {
+    let mut buffer = [0; 1];
+    try!(r.read_exact(&mut buffer).chain_err(|| "Failed to start server"));
+    if buffer[0] == 0 {
+        info!("Server started up successfully");
+        Ok(())
+    } else {
+        let mut err = vec![0; buffer[0] as usize];
+        let msg = r.read_exact(&mut err)
+            .ok()
+            .and_then(|_| String::from_utf8(err).ok())
+            .map(|s| format!("Failed to start server: {}", s))
+            .unwrap_or("Failed to start server".to_owned());
+        error!("{}", msg);
+        bail!(msg);
+    }
+}
+
 /// Re-execute the current executable as a background server, and wait
 /// for it to start up.
 #[cfg(not(windows))]
@@ -142,19 +160,9 @@ fn run_server_process() -> Result<()> {
     }
     // Now read a status from the socket.
     //TODO: when we're using serde, use that here.
-    let (mut stream, _) = try!(listener.accept()
-                               .chain_err(|| "Failed to start server"));
-    let mut buffer = [0; 1];
-    try!(stream.read_exact(&mut buffer).chain_err(|| "Failed to start server"));
-    if buffer[0] == 0 {
-        info!("Server started up successfully");
-        Ok(())
-    } else {
-        //TODO: send error messages over the socket as well.
-        let msg = format!("Failed to start server: {}", buffer[0]);
-        error!("{}", msg);
-        bail!(msg);
-    }
+    let (stream, _) = try!(listener.accept()
+                           .chain_err(|| "Failed to start server"));
+    read_server_startup(stream)
 }
 
 /// Pipe `cmd`'s stdio to `/dev/null`, unless a specific env var is set.
@@ -282,24 +290,12 @@ fn run_server_process() -> Result<()> {
         })
         .and_then(|()| {
             // Wait for a connection on the pipe.
-            let mut pipe = match try!(server.wait_ms(SERVER_STARTUP_TIMEOUT_MS)
+            let pipe = match try!(server.wait_ms(SERVER_STARTUP_TIMEOUT_MS)
                                       .chain_err(|| "Failed to start server")) {
                 Ok(pipe) => pipe,
                 Err(_) => bail!(ErrorKind::ServerStartupTimedOut),
             };
-            // It would be nice to have a read timeout here.
-            let mut buffer = [0; 1];
-            try!(pipe.read_exact(&mut buffer)
-                 .chain_err(|| "Failed to start server"));
-            if buffer[0] == 0 {
-                info!("Server started up successfully");
-                Ok(())
-            } else {
-                //TODO: send error messages over the socket as well.
-                let msg = format!("Failed to start server: {}", buffer[0]);
-                error!("{}", msg);
-                bail!(msg);
-            }
+            read_server_startup(pipe)
         })
 }
 
