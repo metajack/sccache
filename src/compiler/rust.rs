@@ -12,20 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use chrono::*;
 use compiler::{Cacheable, Compiler, CompilerArguments, CompilerHasher, CompilerKind, Compilation,
                HashResult};
 use futures::{Future, future};
 use futures_cpupool::CpuPool;
+use itertools::Itertools;
 use log::LogLevel::Trace;
 use mock_command::{CommandCreatorSync, RunCommand};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::env::consts::DLL_EXTENSION;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::hash::Hash;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::iter::{self, FromIterator};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
@@ -136,15 +138,16 @@ fn arg_in(arg: &str, set: &HashSet<&str>) -> bool
 
 /// Calculate the SHA-1 digest of each file in `files` on background threads
 /// in `pool`.
-fn hash_all(files: Vec<String>, pool: &CpuPool) -> SFuture<Vec<String>>
+fn hash_all(files: Vec<String>, pool: &CpuPool) -> SFuture<Vec<(String, String)>>
 {
     let start = Instant::now();
     let count = files.len();
     let pool = pool.clone();
+    let files2 = files.clone();
     Box::new(future::join_all(files.into_iter().map(move |f| Digest::file(f, &pool)))
              .map(move |hashes| {
                  trace!("Hashed {} files in {}", count, fmt_duration_as_secs(&start.elapsed()));
-                 hashes
+                 files2.into_iter().zip(hashes).collect()
              }))
 }
 
@@ -156,7 +159,7 @@ fn hash_source_files<T>(creator: &T,
                         cwd: &Path,
                         env_vars: &[(OsString, OsString)],
                         pool: &CpuPool)
-                        -> SFuture<Vec<String>>
+                        -> SFuture<Vec<(String, String)>>
     where T: CommandCreatorSync,
 {
     let start = Instant::now();
@@ -188,8 +191,10 @@ fn hash_source_files<T>(creator: &T,
             })
         });
         Box::new(parsed.and_then(move |files| {
-            trace!("[{}]: got {} source files from dep-info in {}", crate_name,
-                   files.len(), fmt_duration_as_secs(&start.elapsed()));
+            if log_enabled!(Trace) {
+                trace!("[{}]: got {} source files from dep-info in {}: {}", crate_name,
+                       files.len(), fmt_duration_as_secs(&start.elapsed()), files.iter().join(" "));
+            }
             // Just to make sure we capture temp_dir.
             drop(temp_dir);
             hash_all(files, &pool)
@@ -246,9 +251,6 @@ fn get_compiler_outputs<T>(creator: &T,
         .env_clear()
         .envs(env_vars.iter().map(|&(ref k, ref v)| (k, v)))
         .current_dir(cwd);
-    if log_enabled!(Trace) {
-        trace!("get_compiler_outputs: {:?}", cmd);
-    }
     let outputs = run_input_output(cmd, None);
     Box::new(outputs.and_then(move |output| -> Result<_> {
         let outstr = String::from_utf8(output.stdout).chain_err(|| "Error parsing rustc output")?;
@@ -289,7 +291,7 @@ impl Rust {
             hash_all(libs, &pool).map(move |digests| {
                 Rust {
                     executable: executable,
-                    compiler_shlibs_digests: digests,
+                    compiler_shlibs_digests: digests.into_iter().map(|(_, d)| d).collect(),
                 }
             })
         }))
@@ -569,6 +571,15 @@ impl<T> CompilerHasher<T> for RustHasher
         let me = *self;
         let RustHasher { executable, compiler_shlibs_digests, parsed_args: ParsedArguments { arguments, output_dir, externs, staticlibs, crate_name, dep_info } } = me;
         trace!("[{}]: generate_hash_key", crate_name);
+        let mut debug_log = env_vars.iter().filter_map(|&(ref k, ref v)| {
+            if k.as_os_str() == OsStr::new("SCCACHE_RUST_CACHE_DEBUG") {
+                let now: DateTime<Local> = Local::now();
+                drop(fs::create_dir_all(v));
+                File::create(Path::new(v).join(format!("{}_{}", crate_name, now.format("%F_%T")))).ok()
+            } else {
+                None
+            }
+        }).next();
         // filtered_arguments omits --emit and --out-dir arguments.
         let filtered_arguments = arguments.iter()
             .filter_map(|&(ref arg, ref val)| {
@@ -601,6 +612,11 @@ impl<T> CompilerHasher<T> for RustHasher
         let hashes = source_hashes.join3(extern_hashes, staticlib_hashes);
         Box::new(hashes.and_then(move |(source_hashes, extern_hashes, staticlib_hashes)|
                                         -> SFuture<_> {
+            if let Some(ref mut debug_log) = debug_log {
+                for &(ref f, ref d) in source_hashes.iter().chain(extern_hashes.iter()).chain(staticlib_hashes.iter()) {
+                    drop(writeln!(debug_log, "{} {}", f, d));
+                }
+            }
             // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
             let mut m = Digest::new();
             // Hash inputs:
@@ -625,16 +641,22 @@ impl<T> CompilerHasher<T> for RustHasher
                     .flat_map(|&(ref arg, ref val)| {
                         iter::once(arg).chain(val.as_ref())
                     })
+                    .inspect(|a| {
+                        if let Some(ref mut debug_log) = debug_log {
+                            drop(writeln!(debug_log, "{}", a.to_string_lossy()));
+                        }
+                    })
                     .fold(OsString::new(), |mut a, b| {
                         a.push(b);
                         a
                     })
             };
+            trace!("[{}]: normalized args: {:?}", crate_name, args);
             args.hash(&mut HashToDigest { digest: &mut m });
             // 4. The digest of all source files (this includes src file from cmdline).
             // 5. The digest of all files listed on the commandline (self.externs).
             // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
-            for h in source_hashes.into_iter().chain(extern_hashes).chain(staticlib_hashes) {
+            for (_, h) in source_hashes.into_iter().chain(extern_hashes).chain(staticlib_hashes) {
                 m.update(h.as_bytes());
             }
             // 7. Environment variables. Ideally we'd use anything referenced
@@ -645,6 +667,18 @@ impl<T> CompilerHasher<T> for RustHasher
             // https://github.com/rust-lang/rust/issues/40364
             let mut env_vars = env_vars.clone();
             env_vars.sort();
+            if log_enabled!(Trace) {
+                let vars = env_vars.iter().filter_map(|&(ref var, ref val)| {
+                    var.to_str().and_then(|s| {
+                        if s.starts_with("CARGO_") {
+                            Some(format!("{}={}", s, val.to_string_lossy()))
+                        } else {
+                            None
+                        }
+                    })
+                }).join(" ");
+                trace!("[{}]: CARGO_ env_vars: {}", crate_name, vars);
+            }
             for &(ref var, ref val) in env_vars.iter() {
                 if var.to_str().map(|s| s.starts_with("CARGO_")).unwrap_or(false) {
                     var.hash(&mut HashToDigest { digest: &mut m });
